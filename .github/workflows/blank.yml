@@ -51,27 +51,33 @@ jobs:
           wget https://nginx.org/download/nginx-${{ github.event.inputs.nginx_version }}.tar.gz
           tar -zxvf nginx-${{ github.event.inputs.nginx_version }}.tar.gz
 
-      - name: Download Pre-built Coraza C-Shared Engine
+      - name: Download and Build Libcoraza Engine
         run: |
-          # 核心修复：直接从官方 Release 抓取预编译好的 C-Shared 引擎 (libcoraza.so 和 coraza.h)
-          echo "Fetching Pre-compiled Coraza C-Shared Engine from official releases..."
+          # 核心修复：克隆官方正确的底层引擎库 libcoraza 并从源码编译
+          echo "Cloning and building libcoraza from source..."
+          git clone https://github.com/corazawaf/libcoraza.git
+          cd libcoraza
           
-          # 通过 GitHub API 动态获取最新的 linux-x86_64 release 下载链接
-          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/corazawaf/coraza-nginx/releases/latest | grep "browser_download_url.*linux-x86_64" | cut -d '"' -f 4 | head -n 1)
+          # 下载 Go 依赖
+          go mod download
           
-          if [ -z "$DOWNLOAD_URL" ]; then
-            echo "Error: Could not fetch Coraza release URL."
-            exit 1
+          # 根据 Coraza 官方标准的底层库编译流程执行
+          if [ -f "build.sh" ]; then
+            chmod +x build.sh
+            ./build.sh
+            ./configure
+            make
+            sudo make install
+          elif [ -f "Makefile" ]; then
+            make
+            sudo make install
+          else
+            # 万一官方更改了构建方式，使用 Go 原生 CGO 构建作为兜底方案
+            go build -buildmode=c-shared -o libcoraza.so .
+            sudo mkdir -p /usr/local/include/coraza
+            sudo cp libcoraza.h /usr/local/include/coraza/coraza.h
+            sudo cp libcoraza.so /usr/local/lib/
           fi
-          
-          echo "Downloading from $DOWNLOAD_URL ..."
-          wget -qO release.tar.gz "$DOWNLOAD_URL"
-          tar -xzf release.tar.gz
-          
-          # 将头文件和库文件提取并放到系统标准路径，供稍后 Nginx 编译时调用
-          sudo mkdir -p /usr/local/include/coraza
-          sudo find . -name "coraza.h" -exec cp {} /usr/local/include/coraza/ \;
-          sudo find . -name "libcoraza.so" -exec cp {} /usr/local/lib/ \;
           
           # 刷新系统动态链接库
           sudo ldconfig
@@ -141,9 +147,15 @@ jobs:
           # 提取融合了 WAF 模块的 Nginx 二进制文件
           cp objs/nginx package_output/
           
-          # 提取我们在上一步下载好的 Coraza CGO 底层引擎库 
-          # (即使静态内置了模块，运行时系统仍需要这个库来解析 Go 代码)
-          cp /usr/local/lib/libcoraza.so package_output/lib/
+          # 智能定位并在系统中提取编译好的 libcoraza.so 引擎库
+          LIBCORAZA_PATH=$(find /usr/local/lib /usr/lib /lib -name "libcoraza.so" | head -n 1)
+          if [ -n "$LIBCORAZA_PATH" ]; then
+            echo "Found libcoraza.so at $LIBCORAZA_PATH"
+            cp "$LIBCORAZA_PATH" package_output/lib/
+          else
+            echo "Error: libcoraza.so not found!"
+            exit 1
+          fi
           
           # 压缩成 tar.gz
           cd package_output
