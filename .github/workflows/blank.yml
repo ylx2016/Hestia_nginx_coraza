@@ -1,0 +1,130 @@
+name: Build Custom Nginx with Coraza WAF
+
+# 触发条件：支持在 GitHub 网页端手动触发 (workflow_dispatch)
+on:
+  workflow_dispatch:
+    inputs:
+      nginx_version:
+        description: '请输入要编译的 Nginx 版本号 (需与当前系统版本一致)'
+        required: true
+        default: '1.31.2'
+      go_version:
+        description: '请输入要使用的 Go 版本 (如 1.22, 1.23, 或 latest)'
+        required: true
+        default: 'latest'
+
+jobs:
+  build:
+    name: Compile Nginx on Ubuntu 24.04
+    runs-on: ubuntu-24.04 # 强制使用 Ubuntu 24.04，确保 glibc 版本与你的 HestiaCP 完全兼容
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ github.event.inputs.go_version }} # 使用自定义的 Go 版本
+          cache: false # 禁用默认缓存，因为代码还没克隆，我们在下一步手动控制
+
+      - name: Cache Go Modules and Build Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          # 使用 OS 和 Go 版本作为缓存前缀，利用 restore-keys 实现跨次运行的缓存复用
+          key: ${{ runner.os }}-go-${{ github.event.inputs.go_version }}-coraza-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ github.event.inputs.go_version }}-coraza-
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          # 安装编译所需的依赖环境（完全对标 HestiaCP 官方环境）
+          sudo apt-get install -y build-essential libpcre3-dev zlib1g-dev libssl-dev libgd-dev libgeoip-dev libxslt1-dev wget git tar
+
+      - name: Download Nginx Source
+        run: |
+          echo "Downloading Nginx version ${{ github.event.inputs.nginx_version }}..."
+          wget https://nginx.org/download/nginx-${{ github.event.inputs.nginx_version }}.tar.gz
+          tar -zxvf nginx-${{ github.event.inputs.nginx_version }}.tar.gz
+
+      - name: Download Coraza Nginx Module
+        run: |
+          echo "Cloning Coraza Nginx module source..."
+          git clone https://github.com/corazawaf/coraza-nginx.git
+
+      - name: Configure and Compile
+        run: |
+          cd nginx-${{ github.event.inputs.nginx_version }}
+          
+          # 完美复刻 HestiaCP Nginx 官方编译参数
+          # 并在末尾使用 --add-module 将 Coraza 静态内置到 Nginx 二进制中
+          ./configure \
+          --prefix=/etc/nginx \
+          --sbin-path=/usr/sbin/nginx \
+          --modules-path=/usr/lib/nginx/modules \
+          --conf-path=/etc/nginx/nginx.conf \
+          --error-log-path=/var/log/nginx/error.log \
+          --http-log-path=/var/log/nginx/access.log \
+          --pid-path=/run/nginx.pid \
+          --lock-path=/run/nginx.lock \
+          --http-client-body-temp-path=/var/cache/nginx/client_temp \
+          --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
+          --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
+          --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
+          --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
+          --user=nginx \
+          --group=nginx \
+          --with-compat \
+          --with-file-aio \
+          --with-threads \
+          --with-http_addition_module \
+          --with-http_auth_request_module \
+          --with-http_dav_module \
+          --with-http_flv_module \
+          --with-http_gunzip_module \
+          --with-http_gzip_static_module \
+          --with-http_mp4_module \
+          --with-http_random_index_module \
+          --with-http_realip_module \
+          --with-http_secure_link_module \
+          --with-http_slice_module \
+          --with-http_ssl_module \
+          --with-http_stub_status_module \
+          --with-http_sub_module \
+          --with-http_v2_module \
+          --with-http_v3_module \
+          --with-mail \
+          --with-mail_ssl_module \
+          --with-stream \
+          --with-stream_realip_module \
+          --with-stream_ssl_module \
+          --with-stream_ssl_preread_module \
+          --with-cc-opt='-g -O2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -ffile-prefix-map=/home/builder/debuild/nginx-1.31.2/debian/debuild-base/nginx-1.31.2=. -flto=auto -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fdebug-prefix-map=/home/builder/debuild/nginx-1.31.2/debian/debuild-base/nginx-1.31.2=/usr/src/nginx-1.31.2-1~noble -fPIC' \
+          --with-ld-opt='-Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -Wl,-z,relro -Wl,-z,now -Wl,--as-needed -pie' \
+          --add-module=../coraza-nginx
+          
+          # 开始编译 (使用双核加速)
+          make -j2
+          
+          # 准备打包目录（不再需要 modules 文件夹，因为已经静态融合）
+          mkdir -p package_output
+          
+          # 仅提取融合后的 Nginx 二进制文件
+          cp objs/nginx package_output/
+          
+          # 压缩成 tar.gz
+          cd package_output
+          tar -czvf ../../nginx_custom.tar.gz nginx
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ github.event.inputs.nginx_version }}-coraza-${{ github.run_number }}"
+          name: "Nginx ${{ github.event.inputs.nginx_version }} (Coraza Static Build)"
+          files: nginx_custom.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
