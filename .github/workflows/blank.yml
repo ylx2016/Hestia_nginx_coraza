@@ -9,7 +9,7 @@ on:
         required: true
         default: '1.31.2'
       go_version:
-        description: '请输入要使用的 Go 版本 (如 1.22.x, 1.23.x)'
+        description: '请输入要使用的 Go 版本 (如 1.26.4)'
         required: true
         default: '1.26.4'
 
@@ -62,10 +62,8 @@ jobs:
           go install github.com/magefile/mage@latest
           export PATH=$PATH:$(go env GOPATH)/bin
           
-          go mod download
-          
           # 兼容不同版本的官方构建方式，生成底层 CGO 库
-          if [ -f "mage.go" ]; then
+          if [ -f "mage.go" ] || [ -f "magefile.go" ]; then
             mage build
           elif [ -f "Makefile" ]; then
             make
