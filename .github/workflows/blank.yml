@@ -9,7 +9,7 @@ on:
         required: true
         default: '1.31.2'
       go_version:
-        description: '请输入要使用的 Go 版本 (如 1.22, 1.23, 或 latest)'
+        description: '请输入要使用的 Go 版本 (如 1.22.x, 1.23.x)'
         required: true
         default: '1.26.4'
 
@@ -51,10 +51,28 @@ jobs:
           wget https://nginx.org/download/nginx-${{ github.event.inputs.nginx_version }}.tar.gz
           tar -zxvf nginx-${{ github.event.inputs.nginx_version }}.tar.gz
 
-      - name: Download Coraza Nginx Module
+      - name: Download and Build Coraza Nginx Module
         run: |
           echo "Cloning Coraza Nginx module source..."
-          git clone https://github.com/corazawaf/coraza-nginx.git
+          git clone --recursive https://github.com/corazawaf/coraza-nginx.git
+          cd coraza-nginx
+          
+          # 核心修复: Nginx 编译 C 代码前，必须先生成 Go 的底层依赖库和头文件 (coraza.h)
+          # 安装 mage 构建工具 (Coraza 官方推荐)
+          go install github.com/magefile/mage@latest
+          export PATH=$PATH:$(go env GOPATH)/bin
+          
+          go mod download
+          
+          # 兼容不同版本的官方构建方式，生成底层 CGO 库
+          if [ -f "mage.go" ]; then
+            mage build
+          elif [ -f "Makefile" ]; then
+            make
+          else
+            mkdir -p build
+            go build -buildmode=c-shared -o build/libcoraza.so .
+          fi
 
       - name: Configure and Compile
         run: |
@@ -110,15 +128,18 @@ jobs:
           # 开始编译 (使用双核加速)
           make -j2
           
-          # 准备打包目录（不再需要 modules 文件夹，因为已经静态融合）
-          mkdir -p package_output
+          # 准备打包目录
+          mkdir -p package_output/lib
           
-          # 仅提取融合后的 Nginx 二进制文件
+          # 提取融合后的 Nginx 二进制文件
           cp objs/nginx package_output/
+          
+          # 提取 Coraza CGO 底层引擎库 (即使静态内置了模块，运行时系统仍需要这个 so 库)
+          find ../coraza-nginx -name "libcoraza.so" -exec cp {} package_output/lib/ \;
           
           # 压缩成 tar.gz
           cd package_output
-          tar -czvf ../../nginx_custom.tar.gz nginx
+          tar -czvf ../../nginx_custom.tar.gz nginx lib/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
