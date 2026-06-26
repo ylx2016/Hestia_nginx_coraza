@@ -11,7 +11,7 @@ on:
       go_version:
         description: '请输入要使用的 Go 版本 (如 1.22, 1.23, 或 latest)'
         required: true
-        default: 'latest'
+        default: '1.26.4'
 
 jobs:
   build:
