@@ -189,6 +189,10 @@ jobs:
           # 自检：确认二进制可执行且 Coraza 模块已编入
           ./objs/nginx -V 2>&1 | grep -q 'coraza-nginx' \
             || { echo "❌ coraza-nginx 模块未编入，构建无效"; exit 1; }
+          # 自检：确认运行期能解析到 libcoraza.so（避免"二进制在但库缺失"）
+          if ldd objs/nginx 2>/dev/null | grep -qi 'libcoraza.*not found'; then
+            echo "❌ libcoraza.so 运行期无法解析，构建无效"; exit 1
+          fi
 
           # 准备打包目录，提取融合 WAF 的 Nginx 二进制
           mkdir -p package_output/lib
@@ -203,9 +207,12 @@ jobs:
             echo "Error: libcoraza.so not found!"; exit 1
           fi
 
-          # 压缩成 tar.gz
+          # 压缩成 tar.gz，并生成 SHA256 校验文件供管理脚本核验完整性
           cd package_output
           tar -czf ../../nginx_custom.tar.gz nginx lib/
+          cd ../..
+          sha256sum nginx_custom.tar.gz | awk '{print $1}' > nginx_custom.tar.gz.sha256
+          echo "SHA256: $(cat nginx_custom.tar.gz.sha256)"
 
       # 用 gh CLI 发布，替代 softprops/action-gh-release（避开其 Node20 弃用告警）。
       # tag 已存在(手动重编)则覆盖上传资产并更新标题；否则新建。
@@ -215,14 +222,14 @@ jobs:
           TAG: ${{ needs.check-updates.outputs.release_tag }}
         run: |
           set -euo pipefail
-          file="nginx_custom.tar.gz"
+          files="nginx_custom.tar.gz nginx_custom.tar.gz.sha256"
           title="Nginx ${NGINX_VERSION} (Coraza Static Build)"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，覆盖上传资产。"
-            gh release upload "$TAG" "$file" --clobber
+            gh release upload "$TAG" $files --clobber
             gh release edit "$TAG" --title "$title"
           else
-            gh release create "$TAG" "$file" --title "$title" \
+            gh release create "$TAG" $files --title "$title" \
               --notes "Nginx ${NGINX_VERSION} + Coraza WAF (libcoraza + coraza-nginx)，编译于 $(date -u '+%Y-%m-%d %H:%M UTC')"
           fi
       # 把本次编译信息写进 main 分支的 README，产生一次仓库提交。
@@ -247,7 +254,7 @@ jobs:
           | --- | --- |
           | linux/amd64 (glibc, Ubuntu 24.04) | [nginx_custom.tar.gz](https://github.com/__REPO__/releases/latest/download/nginx_custom.tar.gz) |
 
-          解压后包含 `nginx` 二进制与 `lib/libcoraza.so` 引擎库。
+          解压后包含 `nginx` 二进制与 `lib/libcoraza.so` 引擎库。校验文件：[nginx_custom.tar.gz.sha256](https://github.com/__REPO__/releases/latest/download/nginx_custom.tar.gz.sha256)。
 
           [查看全部 Release](https://github.com/__REPO__/releases)
 
