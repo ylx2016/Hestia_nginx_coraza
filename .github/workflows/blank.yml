@@ -1,22 +1,86 @@
-name: Build Custom Nginx with Coraza WAF
+name: Auto Build Nginx with Coraza WAF
 
-# 触发条件：支持在 GitHub 网页端手动触发 (workflow_dispatch)
 on:
-  workflow_dispatch:
-    inputs:
-      nginx_version:
-        description: '请输入要编译的 Nginx 版本号 (需与当前系统版本一致)'
-        required: true
-        default: '1.31.2'
-      go_version:
-        description: '请输入要使用的 Go 版本 (如 1.26.4)'
-        required: true
-        default: '1.26.4'
+  workflow_dispatch:      # 支持在 GitHub 网页端手动触发（手动触发会强制重编最新版）
+  schedule:
+    - cron: '17 3 * * 0'  # 每周日 03:17 UTC 自动运行一次
+
+permissions:
+  actions: write
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# 手动触发与定时任务可能撞车，串行化避免同时发 Release / 推 README 打架。
+concurrency:
+  group: build-nginx-coraza
+  cancel-in-progress: false
 
 jobs:
+  # ======== 阶段 1：探测最新版本并决定是否需要编译 ========
+  check-updates:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag:  ${{ steps.check.outputs.release_tag }}
+      nginx_version: ${{ steps.check.outputs.nginx_version }}
+    steps:
+      - name: Check latest Nginx version and Coraza module commit
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # 带 token 走 5000 次/小时额度，避免匿名限流导致取值为 null。
+          auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json")
+
+          # 从 nginx.org 官方下载页解析最新版本号（mainline），sort -V 取最高值。
+          NGINX_LATEST=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -n 1 || true)
+
+          # coraza-nginx 模块最新提交，用于判断 WAF 模块本身是否有更新。
+          CORAZA_HASH=$(curl -fsSL "${auth[@]}" \
+            https://api.github.com/repos/corazawaf/coraza-nginx/commits/main \
+            | jq -r .sha | cut -c1-7 || true)
+
+          if [ -z "$NGINX_LATEST" ] || [ "$NGINX_LATEST" = "null" ]; then
+            echo "❌ 获取 Nginx 最新版本失败 (得到: '$NGINX_LATEST')"; exit 1
+          fi
+          if [ -z "$CORAZA_HASH" ] || [ "$CORAZA_HASH" = "null" ]; then
+            echo "❌ 获取 coraza-nginx commit 失败 (得到: '$CORAZA_HASH')"; exit 1
+          fi
+
+          NEW_TAG="v${NGINX_LATEST}-coraza-${CORAZA_HASH}"
+          echo "Nginx 最新版本: $NGINX_LATEST"
+          echo "Coraza 模块提交: $CORAZA_HASH"
+          echo "Generated Release Tag: $NEW_TAG"
+          echo "nginx_version=$NGINX_LATEST" >> $GITHUB_OUTPUT
+          echo "release_tag=$NEW_TAG"        >> $GITHUB_OUTPUT
+
+          # 手动触发(workflow_dispatch)：绕过「是否已构建」检查，强制编译最新版。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "🔧 手动触发：跳过更新检查，强制编译 $NEW_TAG。"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif gh release view "$NEW_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "✅ 当前版本 $NEW_TAG 已构建过，跳过本次编译。"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "🚀 发现上游有新版本 $NEW_TAG，准备开始编译！"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+  # ======== 阶段 2：编译 Nginx + Coraza WAF ========
   build:
+    needs: check-updates
+    if: needs.check-updates.outputs.should_build == 'true'
     name: Compile Nginx on Ubuntu 24.04
-    runs-on: ubuntu-24.04 # 强制使用 Ubuntu 24.04，确保 glibc 版本与你的 HestiaCP 完全兼容
+    runs-on: ubuntu-24.04   # 固定 24.04，确保 glibc 版本与 HestiaCP 目标环境兼容
+    timeout-minutes: 40
+    env:
+      NGINX_VERSION: ${{ needs.check-updates.outputs.nginx_version }}
 
     steps:
       - name: Checkout repository
@@ -25,43 +89,29 @@ jobs:
       - name: Set up Go environment
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ github.event.inputs.go_version }} # 使用自定义的 Go 版本
-          cache: false # 禁用默认缓存，因为代码还没克隆，我们在下一步手动控制
-
-      - name: Cache Go Modules and Build Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          # 使用 OS 和 Go 版本作为缓存前缀，利用 restore-keys 实现跨次运行的缓存复用
-          key: ${{ runner.os }}-go-${{ github.event.inputs.go_version }}-coraza-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-go-${{ github.event.inputs.go_version }}-coraza-
-
+          go-version: 'stable'   # 始终使用最新稳定版 Go
+          cache: false
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          # 安装编译所需的依赖环境（完全对标 HestiaCP 官方环境）
+          # 编译所需依赖（对标 HestiaCP 官方 Nginx 编译环境）
           sudo apt-get install -y build-essential libpcre3-dev zlib1g-dev libssl-dev libgd-dev libgeoip-dev libxslt1-dev wget git tar jq curl
 
       - name: Download Nginx Source
         run: |
-          echo "Downloading Nginx version ${{ github.event.inputs.nginx_version }}..."
-          wget https://nginx.org/download/nginx-${{ github.event.inputs.nginx_version }}.tar.gz
-          tar -zxvf nginx-${{ github.event.inputs.nginx_version }}.tar.gz
+          set -euo pipefail
+          echo "Downloading Nginx version ${NGINX_VERSION}..."
+          wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
+          tar -zxf nginx-${NGINX_VERSION}.tar.gz
 
       - name: Download and Build Libcoraza Engine
         run: |
-          # 核心修复：克隆官方正确的底层引擎库 libcoraza 并从源码编译
+          set -euo pipefail
           echo "Cloning and building libcoraza from source..."
           git clone https://github.com/corazawaf/libcoraza.git
           cd libcoraza
-          
-          # 下载 Go 依赖
           go mod download
-          
-          # 根据 Coraza 官方标准的底层库编译流程执行
+          # 按 Coraza 官方底层库编译流程执行，并保留兜底方案
           if [ -f "build.sh" ]; then
             chmod +x build.sh
             ./build.sh
@@ -72,27 +122,23 @@ jobs:
             make
             sudo make install
           else
-            # 万一官方更改了构建方式，使用 Go 原生 CGO 构建作为兜底方案
             go build -buildmode=c-shared -o libcoraza.so .
             sudo mkdir -p /usr/local/include/coraza
             sudo cp libcoraza.h /usr/local/include/coraza/coraza.h
             sudo cp libcoraza.so /usr/local/lib/
           fi
-          
-          # 刷新系统动态链接库
           sudo ldconfig
 
       - name: Download Coraza Nginx Module Source
         run: |
           echo "Cloning Coraza Nginx C module source..."
           git clone --recursive https://github.com/corazawaf/coraza-nginx.git
-
       - name: Configure and Compile Nginx
         run: |
-          cd nginx-${{ github.event.inputs.nginx_version }}
-          
-          # 完美复刻 HestiaCP Nginx 官方编译参数
-          # 并在末尾使用 --add-module 将 Coraza 静态内置到 Nginx 二进制中
+          set -euo pipefail
+          cd nginx-${NGINX_VERSION}
+          # 完美复刻 HestiaCP Nginx 官方编译参数，末尾 --add-module 将 Coraza 静态内置。
+          # cc-opt/ld-opt 中的路径按版本号动态生成，避免硬编码旧版本。
           ./configure \
           --prefix=/etc/nginx \
           --sbin-path=/usr/sbin/nginx \
@@ -134,38 +180,121 @@ jobs:
           --with-stream_realip_module \
           --with-stream_ssl_module \
           --with-stream_ssl_preread_module \
-          --with-cc-opt='-g -O2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -ffile-prefix-map=/home/builder/debuild/nginx-1.31.2/debian/debuild-base/nginx-1.31.2=. -flto=auto -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fdebug-prefix-map=/home/builder/debuild/nginx-1.31.2/debian/debuild-base/nginx-1.31.2=/usr/src/nginx-1.31.2-1~noble -fPIC' \
+          --with-cc-opt="-g -O2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -ffile-prefix-map=/home/builder/debuild/nginx-${NGINX_VERSION}/debian/debuild-base/nginx-${NGINX_VERSION}=. -flto=auto -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fdebug-prefix-map=/home/builder/debuild/nginx-${NGINX_VERSION}/debian/debuild-base/nginx-${NGINX_VERSION}=/usr/src/nginx-${NGINX_VERSION}-1~noble -fPIC" \
           --with-ld-opt='-Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -Wl,-z,relro -Wl,-z,now -Wl,--as-needed -pie' \
           --add-module=../coraza-nginx
-          
-          # 开始编译 (使用双核加速)
-          make -j2
-          
-          # 准备打包目录
+          # 使用全部可用核心加速编译
+          make -j"$(nproc)"
+
+          # 自检：确认二进制可执行且 Coraza 模块已编入
+          ./objs/nginx -V 2>&1 | grep -q 'coraza-nginx' \
+            || { echo "❌ coraza-nginx 模块未编入，构建无效"; exit 1; }
+
+          # 准备打包目录，提取融合 WAF 的 Nginx 二进制
           mkdir -p package_output/lib
-          
-          # 提取融合了 WAF 模块的 Nginx 二进制文件
           cp objs/nginx package_output/
-          
-          # 智能定位并在系统中提取编译好的 libcoraza.so 引擎库
-          LIBCORAZA_PATH=$(find /usr/local/lib /usr/lib /lib -name "libcoraza.so" | head -n 1)
+
+          # 智能定位系统中编译好的 libcoraza.so 引擎库（find|head 配 pipefail 需容错）
+          LIBCORAZA_PATH=$(find /usr/local/lib /usr/lib /lib -name "libcoraza.so" 2>/dev/null | head -n 1 || true)
           if [ -n "$LIBCORAZA_PATH" ]; then
             echo "Found libcoraza.so at $LIBCORAZA_PATH"
             cp "$LIBCORAZA_PATH" package_output/lib/
           else
-            echo "Error: libcoraza.so not found!"
-            exit 1
+            echo "Error: libcoraza.so not found!"; exit 1
           fi
-          
+
           # 压缩成 tar.gz
           cd package_output
-          tar -czvf ../../nginx_custom.tar.gz nginx lib/
+          tar -czf ../../nginx_custom.tar.gz nginx lib/
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "v${{ github.event.inputs.nginx_version }}-coraza-${{ github.run_number }}"
-          name: "Nginx ${{ github.event.inputs.nginx_version }} (Coraza Static Build)"
-          files: nginx_custom.tar.gz
+      # 用 gh CLI 发布，替代 softprops/action-gh-release（避开其 Node20 弃用告警）。
+      # tag 已存在(手动重编)则覆盖上传资产并更新标题；否则新建。
+      - name: Release build (gh CLI)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-updates.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          file="nginx_custom.tar.gz"
+          title="Nginx ${NGINX_VERSION} (Coraza Static Build)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖上传资产。"
+            gh release upload "$TAG" "$file" --clobber
+            gh release edit "$TAG" --title "$title"
+          else
+            gh release create "$TAG" "$file" --title "$title" \
+              --notes "Nginx ${NGINX_VERSION} + Coraza WAF (libcoraza + coraza-nginx)，编译于 $(date -u '+%Y-%m-%d %H:%M UTC')"
+          fi
+      # 把本次编译信息写进 main 分支的 README，产生一次仓库提交。
+      # GitHub 会在「仓库 60 天无活动」时自动停用 schedule 触发的 workflow，
+      # 每次构建刷新 README（版本号+时间）即刷新活动时间，让定时任务不被停用。
+      - name: Update README on main (keep schedule alive)
+        run: |
+          set -euo pipefail
+          cat > README.md <<'EOF'
+          # Nginx + Coraza WAF 自动构建
+
+          自动编译静态内置 [Coraza WAF](https://github.com/corazawaf/coraza-nginx)（libcoraza + coraza-nginx）的 Nginx，定时检查上游更新并发布。
+
+          ## 最新版本
+
+          - **版本**：`__TAG__`
+          - **构建时间**：__NOW__
+
+          ## 下载
+
+          | 架构 | 产物 |
+          | --- | --- |
+          | linux/amd64 (glibc, Ubuntu 24.04) | [nginx_custom.tar.gz](https://github.com/__REPO__/releases/latest/download/nginx_custom.tar.gz) |
+
+          解压后包含 `nginx` 二进制与 `lib/libcoraza.so` 引擎库。
+
+          [查看全部 Release](https://github.com/__REPO__/releases)
+
+          ## 说明
+
+          - 定时任务每周日 03:17 UTC 运行，仅当 Nginx 有新版本或 coraza-nginx 有新提交时才编译；手动触发则强制重编。
+          - 始终使用 nginx.org 最新版本与最新稳定版 Go 编译。
+          - 固定在 Ubuntu 24.04 上编译，确保 glibc 版本与 HestiaCP 目标环境兼容。
+          - 每次构建都会更新本 README，以此产生提交、保持仓库活跃，避免 GitHub 因「60 天无活动」自动停用定时任务。
+          - 仅保留最新 3 个 Release。
+
+          <!-- 本文件由 GitHub Actions 自动生成，请勿手动编辑 -->
+          EOF
+          sed -i \
+            -e "s|__TAG__|${{ needs.check-updates.outputs.release_tag }}|g" \
+            -e "s|__REPO__|${{ github.repository }}|g" \
+            -e "s|__NOW__|$(date -u '+%Y-%m-%d %H:%M UTC')|g" \
+            README.md
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          # 内容没变时 commit 会因无改动而失败，用 if 兜住不让整个 job 挂掉
+          if git commit -m "docs: build ${{ needs.check-updates.outputs.release_tag }}"; then
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "README 无变化，跳过提交。"
+          fi
+      # 用 gh CLI 清理旧 Release 与旧 workflow run，控制仓库体积。
+      - name: Prune old releases and workflow runs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "== 删除多余 Release（保留最新 3 个，连同 tag）=="
+          gh release list --limit 200 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+            | while read -r t; do
+                [ -n "$t" ] || continue
+                echo "  删除 release+tag: $t"
+                gh release delete "$t" --yes --cleanup-tag || true
+              done
+
+          echo "== 删除旧 workflow run（保留最近 3 次；进行中的当前 run 会被跳过）=="
+          gh run list --workflow "${{ github.workflow }}" --limit 200 --json databaseId,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].databaseId' \
+            | while read -r id; do
+                [ -n "$id" ] || continue
+                echo "  删除 run: $id"
+                gh run delete "$id" || true
+              done
