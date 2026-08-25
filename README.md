@@ -5,7 +5,7 @@
 ## 最新版本
 
 - **版本**：`v1.31.4-coraza-ce4238f`
-- **构建时间**：2026-08-24 23:36 UTC
+- **构建时间**：2026-08-25 00:01 UTC
 
 ## 下载
 
@@ -13,7 +13,7 @@
 | --- | --- |
 | linux/amd64 (glibc, Ubuntu 24.04) | [nginx_custom.tar.gz](https://github.com/ylx2016/Hestia_nginx_coraza/releases/latest/download/nginx_custom.tar.gz) |
 
-解压后包含 `nginx` 二进制与 `lib/libcoraza.so` 引擎库。
+解压后包含 `nginx` 二进制与 `lib/libcoraza.so` 引擎库。校验文件：[nginx_custom.tar.gz.sha256](https://github.com/ylx2016/Hestia_nginx_coraza/releases/latest/download/nginx_custom.tar.gz.sha256)。
 
 [查看全部 Release](https://github.com/ylx2016/Hestia_nginx_coraza/releases)
 
